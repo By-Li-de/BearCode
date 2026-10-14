@@ -1,0 +1,5 @@
+FROM qwen3.5:9b
+
+# BearCode sends a long system prompt plus built-in and MCP tool schemas.
+PARAMETER num_ctx 16384
+PARAMETER temperature 0.2

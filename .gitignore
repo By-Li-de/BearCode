@@ -25,6 +25,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+doc/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -226,3 +227,15 @@ test_providers.py
 # Internal analysis artifacts (not learning material)
 analysis/
 analysis_progress.md
+
+# Local credentials and environment variants (keep the public template)
+.env.*
+!.env.example
+
+# Machine-specific files, browser output, and private study notes
+.DS_Store
+.idea/
+.vscode/
+.codex/
+.playwright-mcp/
+/doc/

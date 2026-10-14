@@ -10,3 +10,16 @@ __pycache__
 .ruff_cache
 .DS_Store
 docs
+.env.*
+!.env.example
+.idea
+.vscode
+.codex
+.playwright-mcp
+.transcripts
+.task_outputs
+.tasks
+.teams
+.bear/skill-evolution
+.bear/settings.json
+doc
