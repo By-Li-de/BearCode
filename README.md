@@ -135,6 +135,18 @@ MODEL=deepseek-chat
 
 ### 启动 REPL
 
+模型限制与费用估算可在本地 `.env` 中配置：
+
+|变量|用途|
+|---|---|
+|`BEAR_CONTEXT_WINDOW`|当前模型或部署的上下文长度；未识别的模型名称默认使用 32768 tokens|
+|`BEAR_MAX_OUTPUT_TOKENS`|每次请求的输出上限；未识别的模型名称默认使用 4096 tokens，必须小于上下文长度|
+|`BEAR_OPENAI_OUTPUT_PARAMETER`|OpenAI-compatible 输出限制字段，可选 `max_tokens` 或 `max_completion_tokens`；GPT-5、GPT-6 和 o1/o3/o4 名称默认使用后者，自定义部署可显式覆盖|
+|`BEAR_INPUT_PRICE_PER_MTOK`|当前模型每百万输入 tokens 的美元价格|
+|`BEAR_OUTPUT_PRICE_PER_MTOK`|当前模型每百万输出 tokens 的美元价格|
+
+请按实际提供商和部署填写限制与价格。未配置价格时仍能正常运行，只显示 tokens 和费用不可估算；使用 `--max-cost` 时必须配置两项价格，免费本地模型可填 `0`。费用统计包含主请求、记忆/Skill 辅助请求、压缩和子 Agent 已报告的用量；缓存等特殊计费仍按配置的输入单价估算。预算在模型调用前后检查，单次请求及同时进行的辅助请求仍可能超过剩余额度，最终以提供商账单为准。
+
 ```Plain Text
 python3 -m agents.main
 ```
@@ -408,6 +420,24 @@ Bear Code 支持 MCP 外部工具扩展。MCP Server 可以通过 stdio JSON\-RP
 ```Plain Text
 mcp__<serverName>__<toolName>
 ```
+
+每个 MCP 请求默认超时为 60 秒，可在对应服务器配置中设置 `"requestTimeout": 120`（单位：秒）。初始化和工具发现仍各限 15 秒。断线、超时及取消会清理等待中的请求；可能有副作用的工具调用不会自动重试。
+
+## 权限与回归检查
+
+Plan Mode 允许内置只读工具和受同样限制的 Skill/子 Agent；只有当前计划文件可以写入。`allow` 规则不能绕过 Plan Mode，退出 Plan Mode 必须有审批回调确认，一次性 `--plan` 运行不会自行切换为执行模式。
+
+子 Agent 和 fork Skill 继承父 Agent 的权限、确认回调、模型凭据以及剩余预算。默认模式和 `--accept-edits` 下，Shell、未显式允许的 MCP 工具，以及工作目录外的文件或 Skill 修改需要确认；`--dont-ask` 自动拒绝这些确认操作。显式 `allow` 规则可授权相应操作，`--yolo` 则按其含义跳过权限确认。
+
+文件写入的目录检查会解析 `..` 和符号链接，绝对路径不会被静默映射到项目中的同名文件。这是应用层权限控制；内置读取工具仍可读取工作目录外的文件，获准运行的 Shell/MCP 也具有本机进程权限。Dockerfile 提供容器运行方式，项目尚未实现操作系统级沙箱。
+
+回归测试使用 Python 标准库 `unittest`，模型响应由模拟对象提供，MCP 使用临时测试子进程，不需要真实 key 或 API 额度：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+测试覆盖权限规则、目录与符号链接、工具恰好执行一次、两种模型协议、Plan 审批、子 Agent 继承、MCP 超时/断线/取消、Shell 取消、压缩及会话原子保存。
 
 ## Docker 运行
 

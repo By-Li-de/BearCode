@@ -332,7 +332,7 @@ Usage: bear-code [options] [prompt]
 Options:
   --yolo, -y          Skip all confirmation prompts (bypassPermissions mode)
   --plan              Plan mode: read-only, describe changes without executing
-  --accept-edits      Auto-approve file edits, still confirm dangerous shell
+  --accept-edits      Auto-approve file edits, still confirm shell and MCP tools
   --dont-ask          Auto-deny anything needing confirmation (for CI)
   --thinking          Enable extended thinking (Anthropic only)
   --model, -m         Model to use (default: deepseek-chat, or MODEL env)
@@ -385,16 +385,20 @@ Examples:
         sys.exit(1)
 
     # 创建主 Agent。OpenAI-compatible 和 Anthropic 原生接口使用不同的 base URL 参数名传入。
-    agent = Agent(
-        permission_mode=permission_mode,
-        model=model,
-        thinking=args.thinking,
-        max_cost_usd=args.max_cost,
-        max_turns=args.max_turns,
-        api_base=resolved_api_base if resolved_use_openai else None,
-        anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
-        api_key=resolved_api_key,
-    )
+    try:
+        agent = Agent(
+            permission_mode=permission_mode,
+            model=model,
+            thinking=args.thinking,
+            max_cost_usd=args.max_cost,
+            max_turns=args.max_turns,
+            api_base=resolved_api_base if resolved_use_openai else None,
+            anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
+            api_key=resolved_api_key,
+        )
+    except ValueError as error:
+        print_error(f"Invalid runtime configuration: {error}")
+        sys.exit(1)
 
     # Resume session
     # --resume 会加载最近一次会话，把历史消息恢复到新建的 Agent 中。

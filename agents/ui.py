@@ -170,16 +170,13 @@ def print_divider() -> None:
     console.rule("[dim]turn complete[/dim]", style="dim")
 
 
-def print_cost(input_tokens: int, output_tokens: int) -> None:
-    cost_in = (input_tokens / 1_000_000) * 3
-    cost_out = (output_tokens / 1_000_000) * 15
-    total = cost_in + cost_out
+def print_cost(input_tokens: int, output_tokens: int, estimated_cost: float | None = None) -> None:
     table = Table.grid(padding=(0, 2))
     table.add_column(style="cyan")
     table.add_column(style="white")
     table.add_row("input", f"{input_tokens} tokens")
     table.add_row("output", f"{output_tokens} tokens")
-    table.add_row("estimate", f"${total:.4f}")
+    table.add_row("estimate", f"${estimated_cost:.4f}" if estimated_cost is not None else "unavailable (configure token prices)")
     console.print(Panel(table, title="Cost", border_style="cyan", box=box.ROUNDED))
 
 

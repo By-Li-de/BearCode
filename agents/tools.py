@@ -5,6 +5,8 @@ import fnmatch
 import json
 import os
 import re
+import asyncio
+import signal
 import subprocess
 from pathlib import Path
 
@@ -26,17 +28,6 @@ CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search"}
 
 
 
-
-
-
-def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[ToolDef]:
-    """过滤并返回当前可用的工具定义列表，主要用于 API 调用前剔除尚未激活的“延迟工具”（deferred tools），并删除无关的元数据字段。"""
-    tools = all_tools if all_tools is not None else tool_definitions
-    return [
-        {k: v for k, v in t.items() if k != "deferred"}
-        for t in tools
-        if not t.get("deferred") or t["name"] in _activated_tools
-    ]
 
 
 
@@ -218,20 +209,8 @@ tool_definitions: list[ToolDef] = [
 #----------------------工具调用----------------------------
 
 def _resolve_tool_path(raw_path: str, *, must_exist: bool = True) -> Path:
-    path = Path(raw_path)
-    if path.exists() or not path.is_absolute():
-        return path
-
-    parts = path.parts
-    cwd = Path.cwd()
-    for i in range(1, len(parts)):
-        candidate = cwd.joinpath(*parts[i:])
-        if must_exist and candidate.exists():
-            return candidate
-        if not must_exist and candidate.parent.exists():
-            return candidate
-
-    return path
+    # Never silently redirect an absolute path to a similarly named project file.
+    return Path(raw_path).expanduser().resolve()
 
 
 #读取文件并且在读取文件的基础上添加行号
@@ -479,51 +458,41 @@ def get_deferred_tool_names(all_tools: list[ToolDef] | None = None) -> list[str]
     return [t["name"] for t in tools if t.get("deferred") and t["name"] not in _activated_tools]
 
 #执行shell命令
-def _run_shell(inp: dict) -> str:
+async def _run_shell(inp: dict) -> str:
+    process = None
     try:
-        timeout_ms = inp.get("timeout", 30000)
+        timeout_ms = int(inp.get("timeout", 30000))
+        if timeout_ms <= 0:
+            return "Error: timeout must be positive"
         timeout_s = timeout_ms / 1000
-        result = subprocess.run(
+        process = await asyncio.create_subprocess_shell(
             inp["command"],
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=os.name != "nt",
         )
-        output = result.stdout or ""
-        if result.returncode != 0:
-            stderr = f"\nStderr: {result.stderr}" if result.stderr else ""
-            stdout = f"\nStdout: {result.stdout}" if result.stdout else ""
-            return f"Command failed (exit code {result.returncode}){stdout}{stderr}"
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout_s)
+        output = stdout.decode(errors="replace")
+        if process.returncode != 0:
+            error = stderr.decode(errors="replace")
+            return f"Command failed (exit code {process.returncode})\nStdout: {output}\nStderr: {error}"
         return output or "(no output)"
-    except subprocess.TimeoutExpired:
+    except asyncio.TimeoutError:
         return f"Command timed out after {inp.get('timeout', 30000)}ms"
     except Exception as e:
         return f"Error: {e}"
+    finally:
+        if process:
+            # Terminate descendants too: killing only the shell leaves its command running.
+            try:
+                if os.name != "nt":
+                    os.killpg(process.pid, signal.SIGKILL)
+                elif process.returncode is None:
+                    process.kill()
+            except ProcessLookupError:
+                pass
+            await process.communicate()
 
-
-#危险命令检测模式列表
-
-DANGEROUS_PATTERNS = [
-    re.compile(r"\brm\s"),
-    re.compile(r"\bgit\s+(push|reset|clean|checkout\s+\.)"),
-    re.compile(r"\bsudo\b"),
-    re.compile(r"\bmkfs\b"),
-    re.compile(r"\bdd\s"),
-    re.compile(r">\s*/dev/"),
-    re.compile(r"\bkill\b"),
-    re.compile(r"\bpkill\b"),
-    re.compile(r"\breboot\b"),
-    re.compile(r"\bshutdown\b"),
-    re.compile(r"\bdel\s", re.IGNORECASE),
-    re.compile(r"\brmdir\s", re.IGNORECASE),
-    re.compile(r"\bformat\s", re.IGNORECASE),
-    re.compile(r"\btaskkill\s", re.IGNORECASE),
-    re.compile(r"\bRemove-Item\s", re.IGNORECASE),
-    re.compile(r"\bStop-Process\s", re.IGNORECASE),
-]
-def is_dangerous(command: str) -> bool:
-    return any(p.search(command) for p in DANGEROUS_PATTERNS)
 
 #权限规则
 def _parse_rule(rule: str) -> dict:
@@ -577,10 +546,10 @@ def _matches_rule(rule: dict, tool_name: str, inp: dict) -> bool:
     value = ""
     if tool_name == "run_shell":
         value = inp.get("command", "")
-    elif "file_path" in inp:
-        value = inp["file_path"]
+    elif "file_path" in inp or "path" in inp:
+        value = inp.get("file_path") or inp.get("path") or ""
     else:
-        return True
+        return False
 
     pattern = rule["pattern"]
     if pattern.endswith("*"):
@@ -606,26 +575,62 @@ def check_permission(
     plan_file_path: str | None = None,
 ) -> dict:
     """Returns {"action": "allow"|"deny"|"confirm", "message": ...}"""
+    if not isinstance(inp, dict):
+        return {"action": "deny", "message": "Tool arguments must be a JSON object"}
+    write_path = None
+    if tool_name in {"write_file", "edit_file"}:
+        raw_path = inp.get("file_path")
+        if not isinstance(raw_path, str) or not raw_path:
+            return {"action": "deny", "message": "A non-empty file_path is required"}
+        try:
+            write_path = _resolve_tool_path(raw_path)
+        except (OSError, RuntimeError, ValueError):
+            return {"action": "deny", "message": "Invalid file_path"}
     if mode == "bypassPermissions":
         return {"action": "allow"}
 
     rule_result = _check_permission_rules(tool_name, inp)
     if rule_result == "deny":
         return {"action": "deny", "message": f"Denied by permission rule for {tool_name}"}
+
+    if mode == "plan":
+        if tool_name in {"write_file", "edit_file"}:
+            if plan_file_path and write_path == _resolve_tool_path(plan_file_path):
+                return {"action": "allow"}
+        if tool_name not in READ_TOOLS | {"agent", "skill", "tool_search", "enter_plan_mode", "exit_plan_mode"}:
+            return {"action": "deny", "message": f"Blocked in plan mode: {tool_name}"}
+
+    # Explicit rules may grant access outside the workspace, but never bypass plan mode.
     if rule_result == "allow":
         return {"action": "allow"}
 
     if tool_name in READ_TOOLS:
         return {"action": "allow"}
 
-    if mode == "plan":
-        if tool_name in EDIT_TOOLS:
-            file_path = inp.get("file_path") or inp.get("path")
-            if plan_file_path and file_path == plan_file_path:
-                return {"action": "allow"}
-            return {"action": "deny", "message": f"Blocked in plan mode: {tool_name}"}
-        if tool_name == "run_shell":
-            return {"action": "deny", "message": "Shell commands blocked in plan mode"}
+    if tool_name in {"skill_create", "skill_evolve"}:
+        from .skills import get_skill_by_name
+        from .skill_evolution import resolve_skill_file, _safe_skill_slug
+        skill = get_skill_by_name(inp.get("skill_name", "")) if tool_name == "skill_evolve" else None
+        target = inp.get("target") or ("active" if tool_name == "skill_evolve" else "project")
+        if not isinstance(target, str):
+            return {"action": "deny", "message": "Skill target must be a string"}
+        target = target.strip().lower()
+        if tool_name == "skill_evolve":
+            file = resolve_skill_file(inp.get("skill_name", ""), target=target,
+                                      active_dir=skill.skill_dir if skill else "")
+            write_path = file.resolve() if file else None
+        if write_path is None:
+            root = Path.home() if target == "user" else Path.cwd()
+            slug = _safe_skill_slug(inp.get("name") or inp.get("skill_name", ""))
+            write_path = (root / ".bear" / "skills" / slug / "SKILL.md").resolve()
+    if write_path and not write_path.is_relative_to(Path.cwd().resolve()):
+        message = f"{tool_name} outside workspace: {write_path}"
+        return {"action": "deny" if mode == "dontAsk" else "confirm", "message": message}
+
+    # MCP tools can have external side effects; names alone cannot establish read-only safety.
+    if tool_name.startswith("mcp__"):
+        message = f"MCP tool: {tool_name}"
+        return {"action": "deny" if mode == "dontAsk" else "confirm", "message": message}
 
     if tool_name in ("enter_plan_mode", "exit_plan_mode"):
         return {"action": "allow"}
@@ -636,7 +641,8 @@ def check_permission(
     needs_confirm = False
     confirm_message = ""
 
-    if tool_name == "run_shell" and is_dangerous(inp.get("command", "")):
+    if tool_name == "run_shell":
+        # A command-name blacklist cannot contain arbitrary Python, shell expansions, etc.
         needs_confirm = True
         confirm_message = inp.get("command", "")
     elif tool_name == "write_file" and not _resolve_tool_path(inp.get("file_path", ""), must_exist=False).exists():
@@ -741,8 +747,9 @@ async def execute_tool(
         "edit_file": _edit_file,
         "list_files": _list_files,
         "grep_search": _grep_search,
-        "run_shell": _run_shell,
     }
+    if name == "run_shell":
+        return _truncate_result(await _run_shell(inp))
     handler = handlers.get(name)
 
     if not handler:

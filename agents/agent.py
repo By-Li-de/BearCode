@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import time
@@ -82,7 +83,24 @@ MODEL_CONTEXT = {
 }
 
 def _get_context_windows(model:str)->int:
-    return MODEL_CONTEXT.get(model, 200000)
+    return _env_positive_int("BEAR_CONTEXT_WINDOW", MODEL_CONTEXT.get(model, 32768))
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    value = int(os.environ.get(name) or default)
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+def _env_price(name: str) -> float | None:
+    raw = os.environ.get(name)
+    if not raw or not raw.strip():
+        return None
+    value = float(raw)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return value
 
 
 #多层级压缩常数
@@ -96,6 +114,10 @@ KEEP_RECENT_RESULTS = 3
 
 
 def _get_max_output_tokens(model: str) -> int:
+    if os.environ.get("BEAR_MAX_OUTPUT_TOKENS"):
+        return _env_positive_int("BEAR_MAX_OUTPUT_TOKENS", 4096)
+    if model not in MODEL_CONTEXT:
+        return 4096
     m = model.lower()
     if "opus-4-6" in m:
         return 64000
@@ -140,12 +162,31 @@ class Agent:
         self.model = model
         self.use_openai = bool(api_base)
         self.is_sub_agent = is_sub_agent
-        self.tools = custom_tools or tool_definitions
+        self.tools = custom_tools if custom_tools is not None else tool_definitions
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
         self.confirm_fn = confirm_fn
         self._custom_system_prompt = custom_system_prompt
-        self.effective_window=_get_context_windows(model) -20000
+        self.context_window = _get_context_windows(model)
+        self.max_output_tokens = _get_max_output_tokens(model)
+        if self.max_output_tokens >= self.context_window:
+            raise ValueError("BEAR_MAX_OUTPUT_TOKENS must be smaller than BEAR_CONTEXT_WINDOW")
+        remaining_input = self.context_window - self.max_output_tokens
+        self.effective_window = remaining_input - min(2048, remaining_input // 4)
+        self.input_price = _env_price("BEAR_INPUT_PRICE_PER_MTOK")
+        self.output_price = _env_price("BEAR_OUTPUT_PRICE_PER_MTOK")
+        if max_cost_usd is not None:
+            if not math.isfinite(max_cost_usd) or max_cost_usd < 0:
+                raise ValueError("--max-cost must be finite and non-negative")
+            if self.input_price is None or self.output_price is None:
+                raise ValueError("--max-cost requires BEAR_INPUT_PRICE_PER_MTOK and BEAR_OUTPUT_PRICE_PER_MTOK")
+        if max_turns is not None and max_turns < 0:
+            raise ValueError("--max-turns must be non-negative")
+        default_output_parameter = "max_completion_tokens" if model.lower().startswith(
+            ("gpt-5", "gpt-6", "o1", "o3", "o4")) else "max_tokens"
+        self._openai_output_parameter = os.environ.get("BEAR_OPENAI_OUTPUT_PARAMETER") or default_output_parameter
+        if self._openai_output_parameter not in {"max_tokens", "max_completion_tokens"}:
+            raise ValueError("BEAR_OPENAI_OUTPUT_PARAMETER must be max_tokens or max_completion_tokens")
         self.session_id = uuid.uuid4().hex[:8]
         self.session_start_time= time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
 
@@ -227,7 +268,7 @@ class Agent:
         if not self._model_supports_thinking():
             return "disabled"
 
-        if self._mode_supports_adaptive_thinking(self.model):
+        if self._model_supports_adaptive_thinking():
             return "adaptive"
         return "enabled"
 
@@ -280,26 +321,33 @@ class Agent:
             client = self._anthropic_client
             model = self.model
             async def _sq(system:str, user_message:str)->str:
-
+                budget = self._check_budget()
+                if budget["exceeded"]:
+                    raise RuntimeError(budget["reason"])
                 resp = await client.messages.create(
-                    model=model, max_tokens=max(1, int(max_tokens)), system=system,
+                    model=model, max_tokens=min(self.max_output_tokens, max(1, int(max_tokens))), system=system,
                 messages=[{"role": "user", "content": user_message}],
                 )
+                self._record_usage(resp.usage)
                 return "".join(b.text for b in resp.content if b.type == "text")
             return _sq
         if self._openai_client:
             client = self._openai_client
             model = self.model
             async def _sq_openai(system:str, user_message:str)->str:
+                budget = self._check_budget()
+                if budget["exceeded"]:
+                    raise RuntimeError(budget["reason"])
                 resp = await client.chat.completions.create(
                     model=model,
-                    max_tokens=max(1, int(max_tokens)),
+                    **self._openai_output_limit(max_tokens),
                     messages=[
                         {"role": "system", "content": system},
                         {"role": "user", "content": user_message},
                     ],
 
                 )
+                self._record_usage(resp.usage)
                 return resp.choices[0].message.content or "" if resp.choices else ""
             return _sq_openai
         return None
@@ -407,13 +455,15 @@ class Agent:
 
 
    #执行一次对话，收集本轮模型输出文本，并返回本轮消耗的 token 数
-    async def run_once(self, prompt:str)->None:
+    async def run_once(self, prompt:str)->dict:
         self._output_buffer = []
         prev_in = self.total_input_tokens
         prev_out = self.total_output_tokens
-        await self.chat(prompt)
-        text = "".join(self._output_buffer)
-        self._output_buffer = None
+        try:
+            await self.chat(prompt)
+            text = "".join(self._output_buffer)
+        finally:
+            self._output_buffer = None
         return {
             "text": text,
             "tokens":{
@@ -648,20 +698,38 @@ class Agent:
 
     def show_cost(self):
         total = self._get_current_cost_usd()
-        budget_info = f" / ${self.max_cost_usd} budget" if self.max_cost_usd else ""
-        turn_info = f" | Turns: {self.current_turns}/{self.max_turns}" if self.max_turns else ""
+        budget_info = f" / ${self.max_cost_usd} budget" if self.max_cost_usd is not None else ""
+        turn_info = f" | Turns: {self.current_turns}/{self.max_turns}" if self.max_turns is not None else ""
+        cost_text = f"${total:.4f}" if total is not None else "unavailable (configure per-model token prices)"
         print_info(
-            f"Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out\n  Estimated cost: ${total:.4f}{budget_info}{turn_info}")
+            f"Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out\n  Estimated cost: {cost_text}{budget_info}{turn_info}")
 
     #获取当前的花费，
-    def _get_current_cost_usd(self) -> float:
-        return (self.total_input_tokens / 1_000_000) * 3 + (self.total_output_tokens / 1_000_000) * 15
+    def _get_current_cost_usd(self) -> float | None:
+        if self.input_price is None or self.output_price is None:
+            return None
+        return (self.total_input_tokens * self.input_price + self.total_output_tokens * self.output_price) / 1_000_000
+
+    def _record_usage(self, usage: Any) -> None:
+        if usage is None:
+            return
+        if self.use_openai:
+            self.total_input_tokens += usage.prompt_tokens
+            self.total_output_tokens += usage.completion_tokens
+        else:
+            self.total_input_tokens += usage.input_tokens
+            self.total_input_tokens += getattr(usage, "cache_creation_input_tokens", 0) or 0
+            self.total_input_tokens += getattr(usage, "cache_read_input_tokens", 0) or 0
+            self.total_output_tokens += usage.output_tokens
+
+    def _openai_output_limit(self, tokens: int | None = None) -> dict:
+        return {self._openai_output_parameter: min(tokens or self.max_output_tokens, self.max_output_tokens)}
 
     #检查预算
-    def _check_budget(self) -> dict:
+    def _check_budget(self, *, check_turns: bool = True) -> dict:
         if self.max_cost_usd is not None and self._get_current_cost_usd() >= self.max_cost_usd:
             return {"exceeded": True, "reason": f"Cost limit reached (${self._get_current_cost_usd():.4f} >= ${self.max_cost_usd})"}
-        if self.max_turns is not None and self.current_turns >= self.max_turns:
+        if check_turns and self.max_turns is not None and self.current_turns >= self.max_turns:
             return {"exceeded": True, "reason": f"Turn limit reached ({self.current_turns} >= {self.max_turns})"}
         return {"exceeded": False}
 
@@ -771,7 +839,7 @@ class Agent:
         last_user_msg = self._anthropic_messages[-1]
         summary_resp = await self._anthropic_client.messages.create(
             model=self.model,
-            max_tokens=2048,
+            max_tokens=min(2048, self.max_output_tokens),
             system ="You are a conversation summarizer. Be concise but preserve important details.",
             messages=[
                 *_sanitize_for_utf8(self._anthropic_messages[:-1]),
@@ -780,6 +848,7 @@ class Agent:
                 }
             ],
         )
+        self._record_usage(summary_resp.usage)
         summary_text = summary_resp.content[0].text if summary_resp.content and  summary_resp.content[0].type == "text" else "No summary available."
         self._anthropic_messages=[
             {"role":"user","content":f"[Previous conversation summary]\n{summary_text}"},
@@ -787,15 +856,16 @@ class Agent:
         ]
         if last_user_msg.get("role") == "user":
             self._anthropic_messages.append(last_user_msg)
-        self.last_input_tokens=0
+        self.last_input_token_count=0
 
     async def _compact_openai(self)->None:
         if len (self._openai_messages)<4:
             return
         system_msg = self._openai_messages[0]
         last_user_msg = self._openai_messages[-1]
-        summary_resp = await self._openai_client.completions.create(
+        summary_resp = await self._openai_client.chat.completions.create(
             model=self.model,
+            **self._openai_output_limit(2048),
             messages =[
                 {"role": "system", "content": "You are a conversation summarizer. Be concise but preserve important details."},
                 *self._openai_messages[1:-1],
@@ -803,7 +873,8 @@ class Agent:
 
             ],
         )
-        summary_text = summary_resp.choices[0].text if summary_resp.choices and summary_resp.choices[0].type == "text" else ""
+        self._record_usage(summary_resp.usage)
+        summary_text = summary_resp.choices[0].message.content or "" if summary_resp.choices else ""
         self._openai_messages=[
             system_msg,
             {"role": "user", "content": f"[Previous conversation summary]\n{summary_text}"},
@@ -991,6 +1062,10 @@ class Agent:
     #执行工具入口
 
     async def _execute_tool_call(self, name: str, inp: dict) -> str:
+        if name not in {tool["name"] for tool in self.tools}:
+            return f"Action denied: tool '{name}' is not available to this agent"
+        if not isinstance(inp, dict):
+            return "Error: tool arguments must be a JSON object"
         if name in ("enter_plan_mode", "exit_plan_mode"):
             return await self._execute_plan_mode_tool(name)
         if name == "agent":
@@ -1031,18 +1106,9 @@ class Agent:
             )
 
             print_sub_agent_start("skill-fork", inp.get("skill_name", ""))
-            sub_agent = Agent(
-                model=self.model,
-                api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
-                custom_system_prompt=result["prompt"],
-                custom_tools=tools,
-                is_sub_agent=True,
-                permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
-            )
+            sub_agent = self._create_sub_agent(result["prompt"], tools)
             try:
-                sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
-                self.total_input_tokens += sub_result["tokens"]["input"]
-                self.total_output_tokens += sub_result["tokens"]["output"]
+                sub_result = await self._run_sub_agent(sub_agent, inp.get("args") or "Execute this skill task.")
                 print_sub_agent_end("skill-fork", inp.get("skill_name", ""))
                 return sub_result["text"] or "(Skill produced no output)"
             except Exception as e:
@@ -1052,6 +1118,8 @@ class Agent:
         return f'[Skill "{inp.get("skill_name", "")}" activated]\n\n{result["prompt"]}'
 
     async def _execute_plan_mode_tool(self, name):
+        if self.is_sub_agent:
+            return "Action denied: sub-agents inherit the parent's permission mode"
         if name == "enter_plan_mode":
             if self.permission_mode == "plan":
                 return "Already in plan mode."
@@ -1068,10 +1136,10 @@ class Agent:
                 return "Not in plan mode."
             plan_content = "(No plan file found)"
             if self._plan_file_path and Path(self._plan_file_path).exists():
-                plan_content = self._plan_file_path
+                plan_content = Path(self._plan_file_path).read_text()
             # 交互式审批流程（如果有审批函数）
             if self._plan_approval_fn:
-                result = self._plan_approval_fn(plan_content)
+                result = await self._plan_approval_fn(plan_content)
                 choice = result.get("choice", "manual-execute")
 
                 if choice =="keep-planning":
@@ -1090,7 +1158,7 @@ class Agent:
                     target_mode = self._pre_plan_mode or "default"
 
                 #离开计划模式
-                self._pre_plan_mode = target_mode
+                self.permission_mode = target_mode
                 self._pre_plan_mode = None
                 saved_plan_path = self._plan_file_path
                 self._plan_file_path = None
@@ -1114,16 +1182,7 @@ class Agent:
                     f"## Approved Plan:\n{plan_content}\n\n"
                     f"Proceed with implementation."
                 )
-            # 没有审批函数时的回退（例如子代理）
-            self.permission_mode = self._pre_plan_mode or "default"
-            self._pre_plan_mode = None
-            self._plan_file_path = None
-            self._system_prompt = self._base_system_prompt
-            if self.use_openai and self._openai_messages:
-                self._openai_messages[0]["content"] = self._system_prompt
-
-            print_info("Exited plan mode. Restored to " + self.permission_mode + " mode.")
-            return f"Exited plan mode. Permission mode restored to: {self.permission_mode}\n\n## Your Plan:\n{plan_content}"
+            return f"Plan ready, but approval is required before execution. Remain in plan mode.\n\n{plan_content}"
 
         return f"Unknown plan mode tool: {name}"
 
@@ -1143,23 +1202,44 @@ class Agent:
 
         config = get_sub_agent_config(agent_type)
 
-        sub_agent = Agent(
-            model=self.model,
-            api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
-            custom_system_prompt=config["system_prompt"],
-            custom_tools=config["tools"],
-            is_sub_agent=True,
-            permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
-        )
+        sub_agent = self._create_sub_agent(config["system_prompt"], config["tools"])
         try:
-            result = await sub_agent.run_once(prompt)
-            self.total_input_tokens += result["tokens"]["input"]
-            self.total_output_tokens += result["tokens"]["output"]
+            result = await self._run_sub_agent(sub_agent, prompt)
             print_sub_agent_end(agent_type, description)
             return result["text"] or "(Sub-agent produced no output)"
         except Exception as e:
             print_sub_agent_end(agent_type, description)
             return f"Sub-agent error: {e}"
+
+    def _create_sub_agent(self, system_prompt: str, tools: list[ToolDef]) -> Agent:
+        client = self._openai_client if self.use_openai else self._anthropic_client
+        child = Agent(
+            model=self.model,
+            api_base=str(client.base_url) if self.use_openai else None,
+            anthropic_base_url=str(client.base_url) if not self.use_openai else None,
+            api_key=client.api_key,
+            custom_system_prompt=system_prompt,
+            custom_tools=tools,
+            is_sub_agent=True,
+            permission_mode=self.permission_mode,
+            confirm_fn=self.confirm_fn,
+            max_cost_usd=max(0, self.max_cost_usd - self._get_current_cost_usd()) if self.max_cost_usd is not None else None,
+            max_turns=max(0, self.max_turns - self.current_turns) if self.max_turns is not None else None,
+        )
+        # Forked skills may use the parent's already-connected MCP tools.
+        child._mcp_manager = self._mcp_manager
+        return child
+
+    async def _run_sub_agent(self, child: Agent, prompt: str) -> dict:
+        try:
+            return await child.run_once(prompt)
+        finally:
+            # Failed/cancelled child work still consumes tokens and turns.
+            self.total_input_tokens += child.total_input_tokens
+            self.total_output_tokens += child.total_output_tokens
+            self.current_turns += child.current_turns
+            client = child._openai_client if child.use_openai else child._anthropic_client
+            await client.close()
 
 #--------------Anthropic 后端---------------
     async def  _chat_anthropic(self, user_message: str) -> None:
@@ -1181,6 +1261,10 @@ class Agent:
         while True:
             # 外部请求中止时，结束整个 agent loop。
             if self._aborted:
+                break
+            budget = self._check_budget()
+            if budget["exceeded"]:
+                print_info(f"Budget exceeded: {budget['reason']}")
                 break
 
             # 每轮调用模型前尝试压缩上下文，避免消息历史过长。
@@ -1220,29 +1304,13 @@ class Agent:
                 start_spinner()
 
 
-            # 保存“提前执行”的工具任务。key 是 Anthropic 返回的 tool_use block id。
-            early_executions: dict[str, asyncio.Task] = {}
-
-
-            def _on_tool_block(block:dict):
-                # 流式响应中一旦完整收到 tool_use block，如果工具是并发安全且权限允许，
-                # 就可以提前开始执行，减少等待完整模型响应后的空档时间。
-                if block["name"] in CONCURRENCY_SAFE_TOOLS:
-                    perm = check_permission(block["name"], block["input"], self.permission_mode, self._plan_file_path)
-                    if perm["action"]=="allow":
-                        task =asyncio.create_task(self._execute_tool_call(block["name"], block["input"]))
-                        early_executions[block["id"]] = task
-
-
-            # 调用 Anthropic 流式接口；流式过程中完成 tool block 时会触发 _on_tool_block。
-            response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block)
+            response = await self._call_anthropic_stream()
             if not self.is_sub_agent:
                 stop_spinner()
 
             # 记录本次模型调用的耗时点和 token 消耗，用于成本展示与预算控制。
             self.last_api_call_time = time.time()
-            self.total_input_tokens += response.usage.input_tokens
-            self.total_output_tokens += response.usage.output_tokens
+            self._record_usage(response.usage)
             self.last_input_token_count = response.usage.input_tokens
 
             # Anthropic 的响应内容里可能混有 text block 和 tool_use block，这里只挑出工具调用。
@@ -1257,12 +1325,12 @@ class Agent:
             # 没有工具调用，说明模型已经给出最终回复，本轮对话结束。
             if not tool_uses:
                 if not self.is_sub_agent:
-                    print_cost(self.total_input_tokens, self.total_output_tokens)
+                    print_cost(self.total_input_tokens, self.total_output_tokens, self._get_current_cost_usd())
                 break
 
             # 有工具调用时，进入下一轮工具执行。这里同时检查 turn/budget 限制。
             self.current_turns += 1
-            budget = self._check_budget()
+            budget = self._check_budget(check_turns=False)
             if budget["exceeded"]:
                 print_info(f"Budget exceeded: {budget['reason']}")
                 self._anthropic_messages.append({
@@ -1292,21 +1360,6 @@ class Agent:
                 inp = dict(tu.input) if hasattr(tu, "items") else tu.input
                 print_tool_call(tu.name, inp)
 
-                # 如果这个工具已经在流式阶段提前开始执行，这里只需要等待它完成并收集结果。
-                early_task = early_executions.get(tu.id)
-                if early_task:
-                    try:
-                        raw = await early_task
-                    except Exception as e:
-                        raw = f"Error executing tool: {e}"
-                    raw = _safe_utf8_text(raw)
-                    res = self._persist_large_result(tu.name, raw)
-                    print_tool_result(tu.name, res)
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
-                    continue
-
-                # 如果不是提前执行的工具，就在真正执行前做权限检查。
-
                 perm = check_permission(tu.name, inp, self.permission_mode, self._plan_file_path)
                 if perm["action"] == "deny":
                     # 权限拒绝时，也要返回一个 tool_result，让模型知道该工具调用失败的原因。
@@ -1315,7 +1368,7 @@ class Agent:
                                          "content": f"Action denied: {perm.get('message', '')}"})
                     continue
 
-                if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
+                if perm["action"] == "confirm" and perm.get("message") and (tu.name.startswith("mcp__") or perm["message"] not in self._confirmed_paths):
                     # 高风险操作需要用户确认；同一个 message 确认过后会缓存，避免重复询问。
                     confirmed = await self._confirm_dangerous(perm["message"])
                     if not confirmed:
@@ -1367,15 +1420,17 @@ class Agent:
     async def _call_anthropic_stream(self, on_tool_block_complete=None):
 
         async def _do():
-            max_output =  _get_max_output_tokens(self.model)
+            max_output = self.max_output_tokens
 
             create_params: dict[str, Any] = {
                 "model": self.model,
-                "max_tokens": max_output if self._thinking_mode != "disabled" else 16384,
+                "max_tokens": max_output,
                 "system": _safe_utf8_text(self._system_prompt),
                 "tools": _sanitize_for_utf8(get_active_tool_definitions(self.tools)),
                 "messages": _sanitize_for_utf8(self._anthropic_messages),
             }
+            if not create_params["tools"]:
+                del create_params["tools"]
             #如果开启了思考模式，就给 Anthropic 请求加上 thinking 参数。
             if self._thinking_mode  in ("adaptive", "enabled"):
                 create_params["thinking"]={"type": "enabled", "budget_tokens": max_output - 1}
@@ -1467,6 +1522,10 @@ class Agent:
         while True:
             if self._aborted:
                 break
+            budget = self._check_budget()
+            if budget["exceeded"]:
+                print_info(f"Budget exceeded: {budget['reason']}")
+                break
 
             self._run_compression_pipeline()
 
@@ -1514,13 +1573,18 @@ class Agent:
 
             if not tool_calls:
                 if not self.is_sub_agent:
-                    print_cost(self.total_input_tokens, self.total_output_tokens)
+                    print_cost(self.total_input_tokens, self.total_output_tokens, self._get_current_cost_usd())
                 break
 
             self.current_turns += 1
-            budget = self._check_budget()
+            budget = self._check_budget(check_turns=False)
             if budget["exceeded"]:
                 print_info(f"Budget exceeded: {budget['reason']}")
+                self._openai_messages.extend(
+                    {"role": "tool", "tool_call_id": tc["id"],
+                     "content": f"Tool execution skipped: {budget['reason']}"}
+                    for tc in tool_calls
+                )
                 break
 
             oai_checked: list[dict] = []
@@ -1546,7 +1610,7 @@ class Agent:
                     oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False,
                                         "result": f"Action denied: {perm.get('message', '')}"})
                     continue
-                if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
+                if perm["action"] == "confirm" and perm.get("message") and (fn_name.startswith("mcp__") or perm["message"] not in self._confirmed_paths):
                     confirmed = await self._confirm_dangerous(perm["message"])
                     if not confirmed:
                         oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False,
@@ -1555,60 +1619,68 @@ class Agent:
                     self._confirmed_paths.add(perm["message"])
                 oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
 
-                oai_batches: list[dict] = []
-                for ct in oai_checked:
-                    safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
-                    if safe and oai_batches and oai_batches[-1]["concurrent"]:
-                        oai_batches[-1]["items"].append(ct)
-                    else:
-                        oai_batches.append({"concurrent": safe, "items": [ct]})
+            oai_batches: list[dict] = []
+            for ct in oai_checked:
+                safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
+                if safe and oai_batches and oai_batches[-1]["concurrent"]:
+                    oai_batches[-1]["items"].append(ct)
+                else:
+                    oai_batches.append({"concurrent": safe, "items": [ct]})
 
-                oai_context_break = False
-                for batch in oai_batches:
-                    if oai_context_break or self._aborted:
-                        break
+            oai_context_break = False
+            for batch in oai_batches:
+                if oai_context_break or self._aborted:
+                    break
 
-                    if batch["concurrent"]:
-                        async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
+                if batch["concurrent"]:
+                    async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
+                        try:
                             raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
-                            raw = _safe_utf8_text(raw)
-                            res = self._persist_large_result(ct_item["fn"], raw)
-                            print_tool_result(ct_item["fn"], res)
-                            return ct_item, res
+                        except Exception as error:
+                            raw = f"Error executing tool: {error}"
+                        raw = _safe_utf8_text(raw)
+                        res = self._persist_large_result(ct_item["fn"], raw)
+                        print_tool_result(ct_item["fn"], res)
+                        return ct_item, res
 
-                        results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
-                        for ct_item, res in results:
+                    results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
+                    for ct_item, res in results:
+                        self._openai_messages.append(
+                            {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
+                else:
+                    for ct in batch["items"]:
+                        if not ct["allowed"]:
                             self._openai_messages.append(
-                                {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
-                    else:
-                        for ct in batch["items"]:
-                            if not ct["allowed"]:
-                                self._openai_messages.append(
-                                    {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
-                                continue
+                                {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
+                            continue
 
+                        try:
                             raw = await self._execute_tool_call(ct["fn"], ct["inp"])
-                            raw = _safe_utf8_text(raw)
-                            res = self._persist_large_result(ct["fn"], raw)
-                            print_tool_result(ct["fn"], res)
+                        except Exception as error:
+                            raw = f"Error executing tool: {error}"
+                        raw = _safe_utf8_text(raw)
+                        res = self._persist_large_result(ct["fn"], raw)
+                        print_tool_result(ct["fn"], res)
 
-                            if self._context_cleared:
-                                self._context_cleared = False
-                                self._openai_messages.append({"role": "user", "content": res})
-                                oai_context_break = True
-                                break
+                        if self._context_cleared:
+                            self._context_cleared = False
+                            self._openai_messages.append({"role": "user", "content": res})
+                            oai_context_break = True
+                            break
 
-                            self._openai_messages.append(
-                                {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
+                        self._openai_messages.append(
+                            {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
 
             self._context_cleared = False
             await self._check_and_compact()
 
     async def _call_openai_stream(self) -> dict:
         async def _do():
+            active_tools = get_active_tool_definitions(self.tools)
             stream = await self._openai_client.chat.completions.create(
                 model=self.model,
-                tools=_sanitize_for_utf8(_to_openai_tools(get_active_tool_definitions(self.tools))),
+                **self._openai_output_limit(),
+                **({"tools": _sanitize_for_utf8(_to_openai_tools(active_tools))} if active_tools else {}),
                 messages=_sanitize_for_utf8(self._openai_messages),
                 stream=True,
                 stream_options={"include_usage": True},

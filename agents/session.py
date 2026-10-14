@@ -6,6 +6,8 @@ from pathlib import Path
 
 from typing import Any
 import json
+import os
+import tempfile
 
 SESSION_DIR = Path.home() / ".bear-code" / "sessions"
 
@@ -17,7 +19,20 @@ def _ensure_dir() -> None:
 
 def save_session(session_id: str, data: dict[str, Any]) -> None:
     _ensure_dir()
-    (SESSION_DIR / f"{session_id}.json").write_text(json.dumps(data, indent=2, default=str))
+    # Write alongside the destination, then replace atomically so a failed save keeps the old session.
+    content = json.dumps(data, indent=2, default=str, ensure_ascii=False)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=SESSION_DIR,
+                                         suffix=".tmp", delete=False) as file:
+            temporary = Path(file.name)
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, SESSION_DIR / f"{session_id}.json")
+    finally:
+        if temporary and temporary.exists():
+            temporary.unlink()
 
 
 def load_session(session_id: str) -> dict[str, Any] | None:
@@ -25,7 +40,7 @@ def load_session(session_id: str) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
 
@@ -35,7 +50,7 @@ def list_sessions() -> list[dict[str, Any]]:
     results = []
     for f in SESSION_DIR.glob("*.json"):
         try:
-            data = json.loads(f.read_text())
+            data = json.loads(f.read_text(encoding="utf-8"))
             if "metadata" in data:
                 results.append(data["metadata"])
         except Exception:
