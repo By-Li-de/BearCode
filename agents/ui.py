@@ -50,6 +50,7 @@ def print_welcome() -> None:
     commands.add_row("/skills", "list reusable skills")
     commands.add_row("/skill-create", "create a reusable skill")
     commands.add_row("/skill-stats", "show skill evolution stats")
+    commands.add_row("/skill-candidates", "review staged skill improvements")
     commands.add_row("/memory", "list long-term memories")
     commands.add_row("/compact", "compact current context")
     commands.add_row("exit", "quit the session")

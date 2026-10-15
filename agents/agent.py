@@ -539,22 +539,6 @@ class Agent:
                 out.append({"role": role, "content": text})
         return out[-max(2, int(max_messages)) :]
 
-    async def _confirm_online_skill_write(self, summary: str) -> bool:
-        if self.permission_mode in {"bypassPermissions", "acceptEdits"}:
-            return True
-        if self.permission_mode in {"plan", "dontAsk"}:
-            return False
-        if self.confirm_fn is None:
-            return False
-        print_confirmation(summary)
-        try:
-            return bool(await self.confirm_fn(summary))
-        except Exception:
-            return False
-
-    async def _confirm_background_online_skill_write(self, summary: str) -> bool:
-        return self.permission_mode in {"bypassPermissions", "acceptEdits"}
-
     def _online_evolution_enabled(self) -> bool:
         raw = os.environ.get("BEAR_AUTO_SKILL_EVOLUTION", "1").strip().lower()
         return raw not in {"0", "false", "no", "off"}
@@ -618,36 +602,34 @@ class Agent:
             return None
         return {k: v for k, v in ref.items() if k != "all_hits"}
 
-    async def _run_online_skill_evolution(self, window: dict[str, Any], *, interactive_confirm: bool = False) -> None:
+    async def _run_online_skill_evolution(self, window: dict[str, Any]) -> dict:
         if not self._online_evolution_enabled() or self.permission_mode == "plan":
-            return
+            return {"ok": False, "error": "Online evolution is disabled or blocked in plan mode"}
         messages = list(window.get("messages") or [])
         if not messages:
-            return
+            return {"ok": False, "error": "No conversation to extract"}
 
         side_query = self._build_side_query(max_tokens=2200)
         if side_query is None:
-            return
+            return {"ok": False, "error": "No model configured"}
 
         try:
             from .online_skill_evolution import online_ingest
-        except Exception:
-            return
+        except Exception as error:
+            return {"ok": False, "error": str(error)}
 
         result = await online_ingest(
             messages=messages,
             side_query=side_query,
             retrieved_reference=window.get("retrieved_reference") or None,
             hint=str(window.get("hint") or ""),
-            confirm_write=self._confirm_online_skill_write if interactive_confirm else self._confirm_background_online_skill_write,
             target=os.environ.get("BEAR_AUTO_SKILL_TARGET", "project"),
         )
-        if result.get("ok"):
-            if result.get("action") in {"add", "merge"}:
-                self._refresh_runtime_system_prompt()
-                print_info(f"Online skill {result.get('action')}: {result.get('skill')}")
-        elif result.get("action") not in {"add_denied", "merge_denied"}:
+        if result.get("ok") and result.get("action") == "staged":
+            print_info(f"Skill candidate {result['candidate_id']}: {result['skill']} (review with /skill-diff)")
+        elif not result.get("ok"):
             print_error(f"Online skill evolution failed: {result.get('error') or result}")
+        return result
 
     async def _run_skill_usage_tracking(self, original_user_message: str, assistant_text: str) -> None:
         if not self._online_evolution_enabled() or self.permission_mode == "plan":
@@ -678,9 +660,60 @@ class Agent:
             return {"ok": False, "error": "no pending online skill extraction window"}
         window = dict(pending)
         window["hint"] = hint
-        await self._run_online_skill_evolution(window, interactive_confirm=True)
-        self._pending_skill_extraction_window = None
-        return {"ok": True}
+        result = await self._run_online_skill_evolution(window)
+        if result.get("ok"):
+            self._pending_skill_extraction_window = None
+        return result
+
+    async def skill_workflow(self, command: str, args: list[str]) -> dict:
+        """Trusted REPL commands; none are exposed as model-callable tools."""
+        from .skill_validation import (
+            accept_candidate, candidate_diff, candidate_file, evaluate_candidate,
+            list_candidates, load_candidate, reject_candidate, rollback_candidate,
+        )
+        arity = {"candidates": 0, "diff": 1, "eval": 2, "accept": 1, "rollback": 1, "reject": 1}
+        if command not in arity or len(args) != arity[command]:
+            return {"ok": False, "error": "Usage: /skill-candidates, /skill-diff <id>, /skill-eval <id> <cases.json>, /skill-accept|rollback|reject <id>"}
+        try:
+            if command == "candidates":
+                return {"ok": True, "text": list_candidates()}
+            if command == "diff":
+                return {"ok": True, "text": candidate_diff(args[0])}
+            if self.permission_mode == "plan":
+                return {"ok": False, "error": "Skill changes and evaluation reports are blocked in plan mode"}
+            if command in {"accept", "rollback"}:
+                record = load_candidate(args[0])
+                perm = check_permission("write_file", {"file_path": str(candidate_file(record))},
+                                        self.permission_mode, self._plan_file_path)
+                if perm["action"] == "deny":
+                    return {"ok": False, "error": perm.get("message", "Permission denied")}
+                # Typing accept/rollback is the user's explicit approval of this candidate.
+                result = accept_candidate(args[0], model=self.model) if command == "accept" else rollback_candidate(args[0])
+                self._refresh_runtime_system_prompt()
+                result["text"] = f"Skill {result['skill']}: {result['status']} (version {result['version'] or 'removed'})"
+                return result
+            if command == "reject":
+                return reject_candidate(args[0])
+            side_query = self._build_side_query(max_tokens=2048)
+            if side_query is None:
+                return {"ok": False, "error": "No model configured"}
+            self._aborted = False
+            self._current_task = asyncio.create_task(evaluate_candidate(args[0], Path(args[1]).expanduser(), side_query, model=self.model))
+            try:
+                result = await self._current_task
+            except asyncio.CancelledError:
+                if not self._aborted:
+                    raise
+                return {"ok": False, "error": "Evaluation cancelled; previous validation is no longer usable"}
+            finally:
+                self._current_task = None
+            result["text"] = (f"Evaluation {'passed' if result['passed'] else 'did not pass'}: "
+                              f"baseline={result['baseline_score']}/{result['total']}, "
+                              f"candidate={result['candidate_score']}/{result['total']}. "
+                              "Requires every candidate check to pass and a strict improvement.")
+            return result
+        except Exception as error:
+            return {"ok": False, "error": str(error)}
 
 
     def clear_history(self)->None:
@@ -1075,15 +1108,7 @@ class Agent:
             # Route MCP tool calls to the MCP manager
         if self._mcp_manager.is_mcp_tool(name):
             return await self._mcp_manager.call_tool(name, inp)
-        result = await execute_tool(name, inp, self._read_file_state)
-        if name in {"skill_create", "skill_evolve"}:
-            try:
-                parsed = json.loads(result)
-                if isinstance(parsed, dict) and parsed.get("ok"):
-                    self._refresh_runtime_system_prompt()
-            except Exception:
-                pass
-        return result
+        return await execute_tool(name, inp, self._read_file_state)
 
 
     async def _execute_skill_tool(self, inp: dict) -> str:

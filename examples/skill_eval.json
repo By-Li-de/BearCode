@@ -1,0 +1,10 @@
+[
+  {
+    "prompt": "Give a short summary of why version control helps collaboration.",
+    "must_include": ["Summary:"]
+  },
+  {
+    "prompt": "Give a short summary of why regression tests matter.",
+    "must_include": ["Summary:"]
+  }
+]

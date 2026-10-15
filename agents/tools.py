@@ -120,7 +120,7 @@ tool_definitions: list[ToolDef] = [
     },
     {
         "name": "skill_evolve",
-        "description": "Persist an explicit reusable user correction or workflow preference into an existing skill. Creates a version snapshot before editing the skill.",
+        "description": "Stage a reusable correction to an existing skill. Evaluation and manual acceptance are required before activation.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -138,7 +138,7 @@ tool_definitions: list[ToolDef] = [
     },
     {
         "name": "skill_create",
-        "description": "Create a new reusable skill from explicit durable workflow guidance when no suitable existing skill exists.",
+        "description": "Stage a new reusable skill proposal. Evaluation and manual acceptance are required before activation.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -716,29 +716,32 @@ async def execute_tool(
             indent=2,
         )
     if name == "skill_evolve":
-        from .skills import evolve_skill
-
-        result = evolve_skill(
-            skill_name=inp.get("skill_name", ""),
-            lesson=inp.get("lesson", ""),
-            rationale=inp.get("rationale", ""),
-            target=inp.get("target", "active"),
-        )
+        from .skill_validation import stage_candidate
+        from .skill_evolution import resolve_skill_file, _append_evolution_note
+        from .frontmatter import parse_frontmatter
+        from .skills import get_skill_by_name
+        skill_name = inp.get("skill_name", "")
+        target = inp.get("target", "active")
+        skill = get_skill_by_name(skill_name)
+        file = resolve_skill_file(skill_name, target=target, active_dir=skill.skill_dir if skill else "")
+        if file is None:
+            return f"Error: Skill not found: {skill_name}"
+        parsed = parse_frontmatter(file.read_text(encoding="utf-8"))
+        result = stage_candidate(action="merge", name=skill_name,
+                                 description=parsed.meta.get("description", ""),
+                                 instructions=_append_evolution_note(parsed.body, inp.get("lesson", ""), inp.get("rationale", "")),
+                                 target=target, reason=inp.get("rationale", ""), evidence=inp.get("lesson", ""))
         return _truncate_result(json.dumps(result, ensure_ascii=False, indent=2))
 
     if name == "skill_create":
-        from .skills import create_skill
-
-        result = create_skill(
-            name=inp.get("name", ""),
-            description=inp.get("description", ""),
+        from .skill_validation import stage_candidate
+        result = stage_candidate(
+            action="add", name=inp.get("name", ""), description=inp.get("description", ""),
             instructions=inp.get("instructions", ""),
             when_to_use=inp.get("when_to_use", "") or inp.get("when-to-use", ""),
-            target=inp.get("target", "project"),
-            context=inp.get("context", "inline"),
+            target=inp.get("target", "project"), context=inp.get("context", "inline"),
             user_invocable=bool(inp.get("user_invocable", False)),
-            allowed_tools=inp.get("allowed_tools"),
-            evidence=inp.get("evidence", ""),
+            allowed_tools=inp.get("allowed_tools"), evidence=inp.get("evidence", ""),
         )
         return _truncate_result(json.dumps(result, ensure_ascii=False, indent=2))
 

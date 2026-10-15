@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import shlex
 import signal
 import sys
 from urllib.parse import urlparse
 
 from dotenv import find_dotenv, load_dotenv
+from rich.markup import escape
 
 from .agent import Agent
 from .ui import (
@@ -163,7 +165,7 @@ async def run_repl(agent: Agent) -> None:
 
     def handle_sigint(sig, frame):
         nonlocal sigint_count
-        if agent._aborted is False and agent._output_buffer is not None:
+        if agent.is_processing and not agent._aborted:
             # Agent is processing
             agent.abort()
             print_interrupted()
@@ -230,6 +232,18 @@ async def run_repl(agent: Agent) -> None:
         if inp == "/skill-stats":
             print_info(skill_stats())
             continue
+        skill_commands = {"/skill-candidates", "/skill-diff", "/skill-eval", "/skill-accept", "/skill-rollback", "/skill-reject"}
+        if inp.split()[0] in skill_commands:
+            try:
+                parts = shlex.split(inp)
+                result = await agent.skill_workflow(parts[0][len("/skill-"):], parts[1:])
+                if result.get("ok"):
+                    print_info(escape(result.get("text") or str(result)))
+                else:
+                    print_error(str(result.get("error") or result))
+            except ValueError as error:
+                print_error(str(error))
+            continue
         if inp.startswith("/extract_now"):
             hint = inp[len("/extract_now") :].strip()
             result = await agent.extract_now(hint)
@@ -249,6 +263,9 @@ async def run_repl(agent: Agent) -> None:
             print_info(f"Recorded feedback for skill: {parts[0]}")
             continue
         if inp.startswith("/skill-evolve "):
+            if agent.permission_mode == "plan":
+                print_error("Skill edits are blocked in plan mode")
+                continue
             _, rest = inp.split(" ", 1)
             parts = rest.strip().split(" ", 1)
             if len(parts) < 2:
@@ -261,6 +278,9 @@ async def run_repl(agent: Agent) -> None:
                 print_error(str(result.get("error") or result))
             continue
         if inp.startswith("/skill-create "):
+            if agent.permission_mode == "plan":
+                print_error("Skill edits are blocked in plan mode")
+                continue
             _, rest = inp.split(" ", 1)
             parts = [part.strip() for part in rest.split("|", 3)]
             if len(parts) < 4 or not all(parts[:4]):
@@ -350,6 +370,12 @@ REPL commands:
   /memory             List saved memories
   /skills             List available skills
   /skill-stats        Show skill usage and evolution stats
+  /skill-candidates   List staged proposals and evaluation scores
+  /skill-diff <id>    Review the proposed skill version
+  /skill-eval <id> <cases.json>  Compare baseline and candidate (2 model requests per case)
+  /skill-accept <id>  Activate a validated candidate
+  /skill-rollback <id>  Restore the version before acceptance
+  /skill-reject <id>  Discard a pending candidate
   /extract_now        Extract the current pending online skill window: /extract_now [hint]
   /skill-feedback     Record feedback: /skill-feedback <skill> <rating> [note]
   /skill-evolve       Evolve a skill: /skill-evolve <skill> <durable lesson>

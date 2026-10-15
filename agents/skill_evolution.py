@@ -6,6 +6,7 @@ import re
 import shutil
 import time
 import hashlib
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -47,8 +48,23 @@ def _read_json(path: Path, default: Any) -> Any:
 
 
 def _write_json(path: Path, value: Any) -> None:
+    _write_text_atomic(path, json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+
+
+def _write_text_atomic(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         suffix=".tmp", newline="", delete=False) as file:
+            temporary = Path(file.name)
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary and temporary.exists():
+            temporary.unlink()
 
 
 def _safe_skill_slug(name: str) -> str:
@@ -484,6 +500,9 @@ def record_skill_usage_judgments(judgments: list[dict[str, Any]]) -> dict[str, A
 
 
 def _maybe_prune_stale_skill(skill_name: str, stats: dict[str, Any]) -> bool:
+    # Usage judgments alone are not evidence that deleting a skill improves outcomes.
+    if os.environ.get("BEAR_SKILL_AUTO_PRUNE", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return False
     min_retrieved = _parse_int(os.environ.get("BEAR_SKILL_USAGE_PRUNE_MIN_RETRIEVED"), 40)
     max_used = _parse_int(os.environ.get("BEAR_SKILL_USAGE_PRUNE_MAX_USED"), 0)
     source = str(stats.get("source") or "").strip().lower()
@@ -583,6 +602,22 @@ def load_skill_stats() -> dict[str, dict[str, Any]]:
             item["last_retrieved"] = usage.get("last_retrieved", "")
             item["last_used"] = usage.get("last_used", "")
             item["pruned"] = usage.get("pruned", False)
+    for path in (get_evolution_dir() / "candidates").glob("*.json"):
+        record = _read_json(path, {})
+        if not isinstance(record, dict) or not record.get("skill"):
+            continue
+        name = str(record["skill"])
+        item = stats.setdefault(name, {})
+        item["candidates"] = item.get("candidates", 0) + 1
+        state = record.get("status")
+        if isinstance(state, str) and state in {"pending", "validated", "accepted", "rolled_back", "rejected"}:
+            item[state] = item.get(state, 0) + 1
+    for name, item in stats.items():
+        file = resolve_skill_file(name)
+        if file:
+            item["version"] = parse_frontmatter(file.read_text(encoding="utf-8")).meta.get("version", "")
+        else:
+            item.pop("version", None)
     return stats
 
 
@@ -613,5 +648,7 @@ def format_skill_stats() -> str:
             parts.append(f"last_used={item['last_used']}")
         if item.get("pruned"):
             parts.append("pruned=true")
+        if item.get("candidates"):
+            parts.extend(f"{key}={item.get(key, 0)}" for key in ("candidates", "pending", "validated", "accepted", "rolled_back"))
         lines.append(f"  {name}: " + ", ".join(parts))
     return "\n".join(lines)

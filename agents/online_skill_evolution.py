@@ -7,7 +7,6 @@ from typing import Any, Awaitable, Callable
 
 
 SideQuery = Callable[[str, str], Awaitable[str]]
-ConfirmWrite = Callable[[str], Awaitable[bool]]
 
 
 @dataclass
@@ -25,14 +24,16 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     if not raw:
         return {}
     try:
-        return json.loads(raw)
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else {}
     except Exception:
         pass
     start = raw.find("{")
     end = raw.rfind("}")
     if start >= 0 and end > start:
         try:
-            return json.loads(raw[start : end + 1])
+            value = json.loads(raw[start : end + 1])
+            return value if isinstance(value, dict) else {}
         except Exception:
             return {}
     return {}
@@ -138,10 +139,10 @@ async def maintain_online_skill_candidate(
     candidate: OnlineSkillCandidate,
     side_query: SideQuery,
     retrieved_reference: dict[str, Any] | None = None,
-    confirm_write: ConfirmWrite | None = None,
     target: str = "project",
 ) -> dict[str, Any]:
-    from .skills import create_skill, discover_skills, evolve_skill, retrieve_relevant_skills
+    from .skills import discover_skills, get_skill_by_name, retrieve_relevant_skills
+    from .skill_validation import stage_candidate
 
     skills = discover_skills()
     exact_target = _exact_identity_match(candidate, skills)
@@ -183,8 +184,10 @@ async def maintain_online_skill_candidate(
     decision = _parse_json_object(await side_query(system, json.dumps(payload, ensure_ascii=False)))
     action = str(decision.get("action") or "").strip().lower()
     target_skill = str(decision.get("target_skill") or "").strip()
+    if action not in {"add", "merge", "discard"}:
+        action = "discard"
 
-    if exact_target:
+    if action != "discard" and exact_target:
         action = "merge"
         target_skill = exact_target
     elif action == "add" and similar_hits:
@@ -195,51 +198,25 @@ async def maintain_online_skill_candidate(
     elif action == "merge" and not target_skill:
         target_skill = top_reference_name
 
-    if action not in {"add", "merge", "discard"}:
-        action = "discard"
-
     if action == "discard":
         return {"ok": True, "action": "discard", "skill": "", "decision": decision}
 
-    write_summary = f"online skill evolution: {action} {target_skill or candidate.name}"
-    if confirm_write is not None and not await confirm_write(write_summary):
-        return {
-            "ok": False,
-            "action": f"{action}_denied",
-            "skill": target_skill or candidate.name,
-            "error": "permission denied",
-            "decision": decision,
-        }
-
-    if action == "merge":
-        target_skill = target_skill or top_reference_name
-        if not target_skill:
-            return {"ok": False, "action": "merge", "error": "missing target_skill", "decision": decision}
-        result = evolve_skill(
-            skill_name=target_skill,
-            lesson=candidate.evidence or candidate.description,
-            rationale=str(decision.get("reason") or "Online maintainer merge"),
-            target="active",
-            instructions=str(decision.get("merged_instructions") or candidate.instructions),
-            description=str(decision.get("merged_description") or ""),
-            when_to_use=str(decision.get("merged_when_to_use") or candidate.when_to_use),
-            tags=candidate.tags,
-        )
-        return {"action": "merge", "candidate": asdict(candidate), "decision": decision, **result}
-
-    result = create_skill(
-        name=candidate.name,
-        description=candidate.description,
-        instructions=candidate.instructions,
-        when_to_use=candidate.when_to_use,
-        target=target,
-        context="inline",
-        user_invocable=False,
+    # Online maintenance only stages proposals; activation requires replay checks and a manual command.
+    existing = get_skill_by_name(target_skill) if action == "merge" else None
+    if action == "merge" and not existing:
+        return {"ok": False, "action": "merge", "error": "missing target skill", "decision": decision}
+    result = stage_candidate(
+        action=action,
+        name=target_skill if existing else candidate.name,
+        description=str(decision.get("merged_description") or existing.description) if existing else candidate.description,
+        instructions=str(decision.get("merged_instructions") or f"{existing.prompt_template.rstrip()}\n\n{candidate.instructions}") if existing else candidate.instructions,
+        when_to_use=str(decision.get("merged_when_to_use") or existing.when_to_use or candidate.when_to_use) if existing else candidate.when_to_use,
+        target="active" if existing else target,
+        reason=str(decision.get("reason") or "Online skill proposal"),
         evidence=candidate.evidence,
-        actor="online",
         tags=candidate.tags,
     )
-    return {"action": "add", "candidate": asdict(candidate), "decision": decision, **result}
+    return {"candidate": asdict(candidate), "decision": decision, **result}
 
 
 async def online_ingest(
@@ -248,7 +225,6 @@ async def online_ingest(
     side_query: SideQuery,
     retrieved_reference: dict[str, Any] | None = None,
     hint: str = "",
-    confirm_write: ConfirmWrite | None = None,
     target: str = "project",
 ) -> dict[str, Any]:
     from .skills import record_online_provenance
@@ -286,7 +262,6 @@ async def online_ingest(
             candidate=candidate,
             side_query=side_query,
             retrieved_reference=retrieved_reference,
-            confirm_write=confirm_write,
             target=target,
         )
     except Exception as exc:
