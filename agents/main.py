@@ -8,6 +8,7 @@ import os
 import shlex
 import signal
 import sys
+from pathlib import Path
 from urllib.parse import urlparse
 
 from dotenv import find_dotenv, load_dotenv
@@ -42,7 +43,7 @@ from .skills import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="mini-claude",
+        prog="bearcode",
         description="Bear Code — a minimal coding agent",
         add_help=False,
     )
@@ -54,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--thinking", action="store_true", help="Enable extended thinking")
     parser.add_argument("--model", "-m", default=None, help="Model to use")
     parser.add_argument("--api-base", default=None, help="OpenAI-compatible API base URL")
+    parser.add_argument("--env-file", default=None, help="Load a specific environment file")
     parser.add_argument("--resume", action="store_true", help="Resume last session")
     parser.add_argument("--max-cost", type=float, default=None, help="Max USD spend")
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
@@ -80,12 +82,17 @@ def _clean_env(value: str | None) -> str | None:
     return value or None
 
 
-def _load_env_file() -> None:
-    env_path = find_dotenv(usecwd=True)
-    if env_path:
-        load_dotenv(env_path, override=False)
+def _load_env_file(env_file: str | None = None) -> None:
+    explicit = _clean_env(env_file) or _clean_env(os.environ.get("BEAR_ENV_FILE"))
+    if explicit:
+        env_path = Path(explicit).expanduser()
+        if not env_path.is_file():
+            raise ValueError(f"Environment file does not exist: {env_path}")
     else:
-        load_dotenv(override=False)
+        project_env = find_dotenv(usecwd=True)
+        env_path = Path(project_env) if project_env else Path(__file__).resolve().parents[1] / ".env"
+    if env_path.is_file():
+        load_dotenv(env_path, override=False)
 
 
 def _is_anthropic_compatible_base_url(base_url: str | None) -> bool:
@@ -342,12 +349,11 @@ def main() -> None:
     """CLI 程序入口：准备运行配置，创建 Agent，并按参数选择一次性执行或交互模式。"""
     # 解析命令行参数，例如 --plan、--resume、--model，以及可选的一次性 prompt。
     args = parse_args()
-    _load_env_file()
 
     if args.help:
         # 自定义帮助文本，展示 Bear Code 支持的启动参数和 REPL 内置命令。
         print("""
-Usage: bear-code [options] [prompt]
+Usage: bearcode [options] [prompt]
 
 Options:
   --yolo, -y          Skip all confirmation prompts (bypassPermissions mode)
@@ -357,6 +363,7 @@ Options:
   --thinking          Enable extended thinking (Anthropic only)
   --model, -m         Model to use (default: deepseek-chat, or MODEL env)
   --api-base URL      Override API base URL from CLI or .env
+  --env-file PATH     Load a specific .env file (or set BEAR_ENV_FILE)
   --resume            Resume the last session
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
@@ -380,19 +387,23 @@ REPL commands:
   /skill-feedback     Record feedback: /skill-feedback <skill> <rating> [note]
   /skill-evolve       Evolve a skill: /skill-evolve <skill> <durable lesson>
   /skill-create       Create a skill: /skill-create <name> | <description> | <when-to-use> | <instructions>
-  /<skill-name>       Invoke a skill (e.g. /commit "fix types")
+  /<skill-name>       Invoke a skill (e.g. /git-commit "fix types")
 
 Examples:
-  mini-claude "fix the bug in src/app.ts"
-  mini-claude --yolo "run all tests and fix failures"
-  mini-claude --plan "how would you refactor this?"
-  mini-claude --max-cost 0.50 --max-turns 20 "implement feature X"
-  MODEL=deepseek-chat APIKEY=sk-xxx API=https://api.deepseek.com/anthropic mini-claude "hello"
-  MODEL=gpt-4o OPENAI_API_KEY=sk-xxx OPENAI_BASE_URL=https://aihubmix.com/v1 mini-claude "hello"
-  mini-claude --resume
-  mini-claude  # starts interactive REPL
+  bearcode "fix the bug in src/app.ts"
+  bearcode --plan "how would you refactor this?"
+  bearcode --env-file /path/to/.env "hello"
+  bearcode --max-cost 0.50 --max-turns 20 "implement feature X"
+  bearcode --resume
+  bearcode  # starts interactive REPL
 """)
         sys.exit(0)
+
+    try:
+        _load_env_file(args.env_file)
+    except (OSError, ValueError) as error:
+        print_error(f"Invalid environment configuration: {error}")
+        sys.exit(1)
 
     # 将命令行布尔开关统一转换成 Agent 内部使用的权限模式。
     permission_mode = _resolve_permission_mode(args)

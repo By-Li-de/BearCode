@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Launch this checkout's agent without changing the working directory."""
+
+import os
+import sys
+from pathlib import Path
+
+
+root = Path(__file__).resolve().parents[1]
+python = root / '.venv' / 'bin' / 'python'
+if not python.is_file():
+    sys.exit(f'BearCode environment not found at {python}. Follow the README quick start first.')
+
+os.execv(str(python), [str(python), '-c',
+         'import sys; sys.path.insert(0, sys.argv.pop(1)); from agents.main import main; main()',
+         str(root), *sys.argv[1:]])

@@ -28,12 +28,24 @@ For Anthropic-compatible endpoints, use `APIKEY`, `API` (a URL ending in `/anthr
 and `MODEL`, or the native `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` variables.
 Real `.env` files and their backups are ignored by Git.
 
+Install the local command on macOS/Linux after completing setup:
+
 ```bash
-python -m agents.main                         # interactive session; type exit to quit
-python -m agents.main "Explain this project"  # one task
-python -m agents.main --plan "Plan a refactor"
-python -m agents.main --resume
+mkdir -p "$HOME/.local/bin"
+ln -s "$PWD/bin/bearcode" "$HOME/.local/bin/bearcode"
+export PATH="$HOME/.local/bin:$PATH"           # add to your shell profile if needed
+
+bearcode                                    # interactive; type exit to quit
+bearcode "Explain this project"              # one task
+bearcode --plan "Plan a refactor"
+bearcode --resume
 ```
+
+Run `bearcode` from any project directory; that directory remains the workspace.
+It uses this checkout's `.venv` without activation. Configuration comes from the nearest
+project `.env`, falling back to this checkout's `.env` when none exists.
+Use `--env-file PATH` or `BEAR_ENV_FILE` to select a file explicitly; exported variables take precedence.
+`python -m agents.main` still works from this checkout. Moving the checkout requires updating the symlink.
 
 ## Everyday skills
 
