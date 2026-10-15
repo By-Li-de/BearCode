@@ -62,13 +62,14 @@ def execute_skill(skill_name:str, args:object)-> dict | None:
 
 
 def resolve_skill_prompt(skill: SkillDefinition, args: object) -> str:
-    import re
-    prompt = skill.prompt_template
-    # 支持在 SKILL.md 正文中使用 $ARGUMENTS 或 ${ARGUMENTS} 引用用户参数。
-    prompt = re.sub(r"\$ARGUMENTS|\$\{ARGUMENTS\}", str(args or ""), prompt)
-    # 支持 skill 引用自己的目录，例如读取同目录下的 references/scripts。
-    prompt = prompt.replace("${CLAUDE_SKILL_DIR}", skill.skill_dir)
-    return prompt
+    # 单次替换并原样插入参数，避免反斜杠或参数内的占位符被再次解释。
+    replacements = {
+        "$ARGUMENTS": str(args or ""),
+        "${ARGUMENTS}": str(args or ""),
+        "${CLAUDE_SKILL_DIR}": skill.skill_dir,
+    }
+    return re.sub(r"\$ARGUMENTS|\$\{ARGUMENTS\}|\$\{CLAUDE_SKILL_DIR\}",
+                  lambda match: replacements[match.group(0)], skill.prompt_template)
 
 def get_skill_by_name(skill_name:str)->SkillDefinition | None:
     # 通过 name 查找 skill；name 来自 frontmatter，没有写时使用目录名。

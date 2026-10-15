@@ -35,6 +35,22 @@ python -m agents.main --plan "Plan a refactor"
 python -m agents.main --resume
 ```
 
+## Everyday skills
+
+Use `/skills` to list installed skills. These project skills support English and Chinese requests
+and can also be invoked directly in an interactive session:
+
+| Command | Purpose |
+| --- | --- |
+| `/debugging <failure>` | Reproduce a failure, find its cause, and verify a focused fix |
+| `/test-and-verify <change>` | Check behavior with relevant tests and report coverage gaps |
+| `/explain-project <question>` | Trace architecture or a feature through current source |
+| `/minimal-refactor <scope>` | Simplify code while preserving behavior |
+| `/git-commit <scope>` | Prepare a focused commit; pushing requires user authorization |
+
+The existing `code_review` skill handles code review requests automatically.
+Restart a running session after editing skill files to refresh the skill cache.
+
 ## Skill evolution
 
 Feedback and model skill tools **stage candidates instead of changing active skills**.
